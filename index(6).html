@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Room Sound Map</title>
+
+<!-- PeerJS lets the phones talk to each other -->
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+
+<style>
+  body {
+    font-family: Arial, Helvetica, sans-serif;
+    background: #eef1f4;
+    color: #222;
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 16px;
+  }
+  h1 { font-size: 26px; margin: 0 0 4px; }
+  h2 { font-size: 18px; margin: 0 0 8px; }
+  p  { margin: 4px 0 10px; }
+  .box {
+    background: white;
+    border: 1px solid #ccd;
+    border-radius: 6px;
+    padding: 12px;
+    margin-bottom: 14px;
+  }
+  button {
+    padding: 8px 12px;
+    margin: 3px 3px 3px 0;
+    border: 1px solid #889;
+    border-radius: 4px;
+    background: #f7f7fa;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  button:hover { background: #e4e8f0; }
+  button.main { background: #2b6cb0; color: white; border-color: #2b6cb0; }
+  input { padding: 6px; font-size: 14px; width: 90px; }
+  label { margin-right: 10px; font-size: 14px; }
+  canvas {
+    display: block;
+    width: 100%;
+    background: #15191e;
+    border-radius: 4px;
+    touch-action: none;
+  }
+  #map     { height: 360px; }
+  #tracker { height: 240px; }
+  #code  { font-size: 22px; font-weight: bold; letter-spacing: 4px; }
+  #status { color: #555; font-size: 14px; }
+  .small  { font-size: 13px; color: #666; }
+  .legend { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-top: 6px; }
+  .legend .bar {
+    width: 180px; height: 10px; border-radius: 5px;
+    background: linear-gradient(90deg, hsl(240,90%,50%), hsl(180,90%,45%), hsl(120,90%,45%), hsl(60,90%,50%), hsl(0,90%,50%));
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin-top: 10px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #ddd; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
+</style>
+</head>
+
+<body>
+
+<h1>Room Sound Map</h1>
+<p>Put phones around the room. The map shows where it's loud, the tracker shows each phone's level over time.</p>
+
+<!-- ============ controls ============ -->
+<div class="box">
+  <button class="main" onclick="startMic()">Turn on microphone</button>
+  <button onclick="addFakePhones()">Add fake phones (test)</button>
+  <br><br>
+  <b>Main screen:</b>
+  <button onclick="createRoom()">Create room</button>
+  Room code: <span id="code">----</span>
+  <br><br>
+  <b>Phone:</b>
+  <label>Name <input id="nameInput" value="Phone"></label>
+  <label>Code <input id="joinInput" maxlength="4" placeholder="ABCD"></label>
+  <button onclick="joinRoom()">Join room</button>
+  <p id="status">Not connected.</p>
+</div>
+
+<!-- ============ heatmap ============ -->
+<div class="box">
+  <h2>Sound heatmap</h2>
+  <label>Room width (m) <input id="roomW" type="number" value="8" min="2" max="40" onchange="readRoomSize()"></label>
+  <label>Room depth (m) <input id="roomD" type="number" value="6" min="2" max="40" onchange="readRoomSize()"></label>
+  <p class="small">Drag the dots to where the phones really are. Colours between phones are guessed.</p>
+  <canvas id="map"></canvas>
+  <div class="legend">
+    <span id="legendLow">quiet</span><span class="bar"></span><span id="legendHigh">loud</span>
+  </div>
+</div>
+
+<!-- ============ tracker ============ -->
+<div class="box">
+  <h2>Signal tracker</h2>
+  <p class="small">Each phone's loudness over the last 60 seconds. Levels are in dBFS (0 = the loudest the mic can record), not calibrated.</p>
+  <canvas id="tracker"></canvas>
+  <table>
+    <thead><tr><th>Phone</th><th>Now</th><th>Average</th><th>Max</th></tr></thead>
+    <tbody id="table"></tbody>
+  </table>
+</div>
+
+<script>
+// ------------------------------------------------------------
+//  Settings
+// ------------------------------------------------------------
+let roomW = 8;          // metres
+let roomD = 6;          // metres
+const HISTORY = 60;     // seconds kept in the tracker
+const COLORS = ['#ff5a5a', '#4cd964', '#4aa3ff', '#ffb340', '#c77dff', '#40e0d0', '#ff7ac6', '#d4ff40'];
+const PREFIX = 'roomsoundmap-';   // added in front of the room code
+
+// All the phones we know about. Key = id.
+// Each one looks like: { id, name, x, y, level, color, history: [{t, db}], lastSeen, fake }
+let phones = {};
+
+let role = 'alone';     // 'alone', 'host' or 'guest'
+let myName = 'This device';
+
+function $(id) { return document.getElementById(id); }
+function setStatus(text) { $('status').textContent = text; }
+
+
+// ------------------------------------------------------------
+//  Microphone
+// ------------------------------------------------------------
+let analyser = null;
+let samples = null;
+let myLevel = -100;
+
+async function startMic() {
+  if (analyser) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+    const ctx = new AudioContext();
+    await ctx.resume();
+    const source = ctx.createMediaStreamSource(stream);
+    analyser = ctx.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+    samples = new Float32Array(analyser.fftSize);
+    setStatus('Microphone is on.' + (role === 'guest' ? ' Sending to the main screen.' : ''));
+  } catch (err) {
+    setStatus('Could not turn on the microphone: ' + err.message + '. The page has to be opened from an https:// address.');
+  }
+}
+
+// loudness of the last bit of audio, in dBFS
+function readMic() {
+  analyser.getFloatTimeDomainData(samples);
+  let sum = 0;
+  for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+  const rms = Math.sqrt(sum / samples.length);
+  return Math.max(-100, 20 * Math.log10(rms + 1e-10));
+}
+
+
+// ------------------------------------------------------------
+//  Phones list
+// ------------------------------------------------------------
+function updatePhone(id, name, db) {
+  let p = phones[id];
+  if (!p) {
+    const count = Object.keys(phones).length;
+    p = {
+      id: id,
+      x: 1 + Math.random() * (roomW - 2),
+      y: 1 + Math.random() * (roomD - 2),
+      color: COLORS[count % COLORS.length],
+      history: []
+    };
+    phones[id] = p;
+  }
+  p.name = name;
+  p.level = db;
+  p.lastSeen = Date.now();
+  return p;
+}
+
+function addFakePhones() {
+  if (role === 'guest') { setStatus('Fake phones only work on the main screen.'); return; }
+  for (let i = 1; i <= 3; i++) {
+    const p = updatePhone('fake' + i, 'Fake ' + i, -60 + Math.random() * 20);
+    p.fake = true;
+  }
+}
+
+function readRoomSize() {
+  roomW = Math.max(2, Number($('roomW').value) || 8);
+  roomD = Math.max(2, Number($('roomD').value) || 6);
+  // keep phones inside the new room
+  for (const p of Object.values(phones)) {
+    p.x = Math.min(p.x, roomW);
+    p.y = Math.min(p.y, roomD);
+  }
+}
+
+
+// ------------------------------------------------------------
+//  Connecting phones (PeerJS)
+// ------------------------------------------------------------
+let peer = null;
+let hostConn = null;   // guest -> main screen
+let guests = [];       // main screen -> each guest
+
+function randomCode() {
+  const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let code = '';
+  for (let i = 0; i < 4; i++) code += letters[Math.floor(Math.random() * letters.length)];
+  return code;
+}
+
+function createRoom() {
+  if (typeof Peer === 'undefined') { setStatus('Could not load PeerJS. Check the internet connection.'); return; }
+  if (peer) peer.destroy();
+  const code = randomCode();
+  peer = new Peer(PREFIX + code);
+
+  peer.on('open', () => {
+    role = 'host';
+    myName = 'Main screen';
+    $('code').textContent = code;
+    setStatus('Room ' + code + ' is open. On each phone, open this page, type the code and press Join room.');
+  });
+
+  peer.on('connection', conn => {
+    guests.push(conn);
+    conn.on('data', msg => {
+      if (msg.type === 'level') updatePhone(conn.peer, msg.name, msg.db);
+    });
+    conn.on('close', () => {
+      guests = guests.filter(c => c !== conn);
+      delete phones[conn.peer];
+    });
+  });
+
+  peer.on('error', err => {
+    if (err.type === 'unavailable-id') createRoom();   // code already taken, try another
+    else setStatus('Connection problem: ' + err.type);
+  });
+}
+
+function joinRoom() {
+  if (typeof Peer === 'undefined') { setStatus('Could not load PeerJS. Check the internet connection.'); return; }
+  const code = $('joinInput').value.trim().toUpperCase();
+  if (code.length !== 4) { setStatus('Type the 4-letter room code first.'); return; }
+  myName = $('nameInput').value.trim() || 'Phone';
+  if (peer) peer.destroy();
+  peer = new Peer();
+
+  peer.on('open', () => {
+    hostConn = peer.connect(PREFIX + code);
+    hostConn.on('open', () => {
+      role = 'guest';
+      phones = {};
+      setStatus('Joined room ' + code + '.' + (analyser ? ' Sending sound levels.' : ' Now press "Turn on microphone".'));
+    });
+    // the main screen sends us the full list so we can see the map too
+    hostConn.on('data', msg => {
+      if (msg.type !== 'all') return;
+      for (const item of msg.phones) {
+        const p = updatePhone(item.id, item.name, item.level);
+        p.x = item.x;
+        p.y = item.y;
+        p.color = item.color;
+      }
+      roomW = msg.roomW;
+      roomD = msg.roomD;
+    });
+    hostConn.on('close', () => { role = 'alone'; setStatus('Lost the main screen.'); });
+  });
+
+  peer.on('error', err => {
+    if (err.type === 'peer-unavailable') setStatus('No room with code ' + code + '. Check the code.');
+    else setStatus('Connection problem: ' + err.type);
+  });
+}
+
+
+// ------------------------------------------------------------
+//  Main loop: runs 5 times a second
+// ------------------------------------------------------------
+function tick() {
+  const now = Date.now();
+
+  // 1. my own microphone
+  if (analyser) {
+    myLevel = myLevel * 0.6 + readMic() * 0.4;   // smooth it a bit
+    if (role === 'guest') {
+      if (hostConn && hostConn.open) hostConn.send({ type: 'level', name: myName, db: myLevel });
+    } else {
+      updatePhone('me', myName, myLevel);
+    }
+  }
+
+  // 2. fake phones wander up and down
+  for (const p of Object.values(phones)) {
+    if (!p.fake) continue;
+    p.level += (Math.random() - 0.5) * 3;
+    p.level = Math.min(-20, Math.max(-80, p.level));
+    p.lastSeen = now;
+  }
+
+  // 3. forget phones we haven't heard from in 5 seconds, save history
+  for (const p of Object.values(phones)) {
+    if (now - p.lastSeen > 5000) { delete phones[p.id]; continue; }
+    p.history.push({ t: now, db: p.level });
+    while (p.history.length && now - p.history[0].t > HISTORY * 1000) p.history.shift();
+  }
+
+  // 4. main screen shares everything with the phones
+  if (role === 'host' && guests.length) {
+    const list = Object.values(phones).map(p => ({ id: p.id, name: p.name, x: p.x, y: p.y, level: p.level, color: p.color }));
+    for (const conn of guests) if (conn.open) conn.send({ type: 'all', phones: list, roomW: roomW, roomD: roomD });
+  }
+
+  drawMap();
+  drawTracker();
+  drawTable();
+}
+setInterval(tick, 200);
+
+
+// ------------------------------------------------------------
+//  Drawing helpers
+// ------------------------------------------------------------
+// makes the canvas sharp on phones and returns [ctx, width, height]
+function getCanvas(id) {
+  const canvas = $(id);
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== Math.round(w * dpr)) { canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr); }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return [ctx, w, h];
+}
+
+// 0 = blue (quiet) ... 1 = red (loud)
+function heatColor(v) {
+  v = Math.min(1, Math.max(0, v));
+  return 'hsl(' + (240 - 240 * v) + ', 90%, 50%)';
+}
+
+
+// ------------------------------------------------------------
+//  Heatmap
+// ------------------------------------------------------------
+let view = { ox: 0, oy: 0, scale: 1 };   // metres -> pixels, used for dragging too
+
+function drawMap() {
+  const [ctx, W, H] = getCanvas('map');
+  const list = Object.values(phones);
+
+  // fit the room in the canvas
+  const pad = 24;
+  const scale = Math.min((W - pad * 2) / roomW, (H - pad * 2) / roomD);
+  const ox = (W - roomW * scale) / 2;
+  const oy = (H - roomD * scale) / 2;
+  view = { ox, oy, scale };
+
+  if (list.length === 0) {
+    ctx.strokeStyle = '#556';
+    ctx.strokeRect(ox, oy, roomW * scale, roomD * scale);
+    ctx.fillStyle = '#aab';
+    ctx.font = '14px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('No phones yet. Turn on the microphone or add fake phones.', W / 2, H / 2);
+    $('legendLow').textContent = 'quiet';
+    $('legendHigh').textContent = 'loud';
+    return;
+  }
+
+  // colour range from the quietest to the loudest phone
+  let low = Math.min(...list.map(p => p.level)) - 3;
+  let high = Math.max(...list.map(p => p.level)) + 3;
+  if (high - low < 10) { const mid = (high + low) / 2; low = mid - 5; high = mid + 5; }
+
+  // fill the room with little squares.
+  // each square's loudness = average of the phones, closer phones count more
+  const cell = 8;
+  for (let px = 0; px < roomW * scale; px += cell) {
+    for (let py = 0; py < roomD * scale; py += cell) {
+      const mx = (px + cell / 2) / scale;
+      const my = (py + cell / 2) / scale;
+      let total = 0, weights = 0;
+      for (const p of list) {
+        const dist2 = (p.x - mx) ** 2 + (p.y - my) ** 2 + 0.05;
+        const w = 1 / dist2;
+        total += w * p.level;
+        weights += w;
+      }
+      const db = total / weights;
+      ctx.fillStyle = heatColor((db - low) / (high - low));
+      ctx.fillRect(ox + px, oy + py, cell + 1, cell + 1);
+    }
+  }
+
+  // room outline
+  ctx.strokeStyle = 'white';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(ox, oy, roomW * scale, roomD * scale);
+
+  // phones
+  ctx.font = 'bold 12px Arial';
+  ctx.textAlign = 'center';
+  ctx.lineJoin = 'round';
+  for (const p of list) {
+    const x = ox + p.x * scale, y = oy + p.y * scale;
+    ctx.beginPath();
+    ctx.arc(x, y, 9, 0, Math.PI * 2);
+    ctx.fillStyle = p.color;
+    ctx.fill();
+    ctx.strokeStyle = 'black';
+    ctx.stroke();
+    ctx.fillStyle = 'white';
+    ctx.strokeStyle = 'black';
+    ctx.lineWidth = 3;
+    const label = p.name + '  ' + p.level.toFixed(0) + ' dB';
+    ctx.strokeText(label, x, y - 14);
+    ctx.fillText(label, x, y - 14);
+    ctx.lineWidth = 2;
+  }
+
+  $('legendLow').textContent = low.toFixed(0) + ' dB';
+  $('legendHigh').textContent = high.toFixed(0) + ' dB';
+}
+
+// dragging phones on the map (main screen only)
+let dragging = null;
+$('map').addEventListener('pointerdown', e => {
+  if (role === 'guest') return;
+  const r = $('map').getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  for (const p of Object.values(phones)) {
+    const x = view.ox + p.x * view.scale, y = view.oy + p.y * view.scale;
+    if (Math.hypot(x - mx, y - my) < 20) { dragging = p; $('map').setPointerCapture(e.pointerId); break; }
+  }
+});
+$('map').addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const r = $('map').getBoundingClientRect();
+  dragging.x = Math.min(roomW, Math.max(0, (e.clientX - r.left - view.ox) / view.scale));
+  dragging.y = Math.min(roomD, Math.max(0, (e.clientY - r.top - view.oy) / view.scale));
+  drawMap();
+});
+$('map').addEventListener('pointerup', () => { dragging = null; });
+
+
+// ------------------------------------------------------------
+//  Tracker (level over time)
+// ------------------------------------------------------------
+function drawTracker() {
+  const [ctx, W, H] = getCanvas('tracker');
+  const list = Object.values(phones);
+  const now = Date.now();
+  const left = 44, right = W - 12, top = 12, bottom = H - 26;
+
+  // y range: round the lowest and highest values to 10 dB
+  let all = [];
+  for (const p of list) for (const h of p.history) all.push(h.db);
+  let low = all.length ? Math.floor(Math.min(...all) / 10) * 10 : -80;
+  let high = all.length ? Math.ceil(Math.max(...all) / 10) * 10 : -20;
+  if (high - low < 20) low = high - 20;
+
+  const X = t => right - (now - t) / (HISTORY * 1000) * (right - left);
+  const Y = db => bottom - (db - low) / (high - low) * (bottom - top);
+
+  // grid
+  ctx.font = '11px Arial';
+  ctx.strokeStyle = '#2c333b';
+  ctx.fillStyle = '#99a';
+  ctx.lineWidth = 1;
+  ctx.textAlign = 'right';
+  for (let db = low; db <= high; db += 10) {
+    ctx.beginPath(); ctx.moveTo(left, Y(db)); ctx.lineTo(right, Y(db)); ctx.stroke();
+    ctx.fillText(db + ' dB', left - 5, Y(db) + 4);
+  }
+  ctx.textAlign = 'center';
+  for (let s = 0; s <= HISTORY; s += 10) {
+    const x = right - s / HISTORY * (right - left);
+    ctx.fillText(s === 0 ? 'now' : '-' + s + 's', x, H - 8);
+  }
+
+  if (list.length === 0) {
+    ctx.fillStyle = '#aab';
+    ctx.font = '14px Arial';
+    ctx.fillText('Waiting for signals...', (left + right) / 2, (top + bottom) / 2);
+    return;
+  }
+
+  // one line per phone
+  ctx.lineWidth = 2;
+  for (const p of list) {
+    ctx.strokeStyle = p.color;
+    ctx.beginPath();
+    p.history.forEach((h, i) => {
+      if (i === 0) ctx.moveTo(X(h.t), Y(h.db));
+      else ctx.lineTo(X(h.t), Y(h.db));
+    });
+    ctx.stroke();
+  }
+}
+
+function drawTable() {
+  const rows = Object.values(phones).map(p => {
+    const values = p.history.map(h => h.db);
+    const avg = values.length ? values.reduce((a, b) => a + b, 0) / values.length : p.level;
+    const max = values.length ? Math.max(...values) : p.level;
+    return '<tr><td><span class="dot" style="background:' + p.color + '"></span>' + escapeHtml(p.name) + '</td>' +
+           '<td>' + p.level.toFixed(1) + ' dB</td>' +
+           '<td>' + avg.toFixed(1) + ' dB</td>' +
+           '<td>' + max.toFixed(1) + ' dB</td></tr>';
+  });
+  $('table').innerHTML = rows.join('') || '<tr><td colspan="4" class="small">No phones yet.</td></tr>';
+}
+
+// phone names come from other people, so make them safe to show
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+</script>
+
+</body>
+</html>
